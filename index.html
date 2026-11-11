@@ -144,7 +144,7 @@ const qs = new URLSearchParams(location.search);
 // Servidores de mensagens (MQTT público sobre WebSocket seguro), em paralelo. Pode ser trocado com ?broker=wss://...
 const BROKERS = qs.get('broker') ? qs.get('broker').split(',') : [
   'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt' ];
-const VERSION = 'v1 · 2026-11-11';
+const VERSION = 'v2 · 2026-11-11';
 const TOPIC = 'jogo-stop-v1';
 const COUNTDOWN_MS = 3000;   // contagem decrescente antes de revelar a letra
 const GRACE_MS = 2000;       // tempo, após o STOP, para recolher as últimas respostas em trânsito
@@ -221,7 +221,8 @@ function startHost(resume){
     if (G.phase === 'play' || G.phase === 'closing') { G.phase = 'closing'; G.round.stoppedAt = G.round.stoppedAt || Date.now(); G.round.endedBy = G.round.endedBy || 'host'; }
   } else {
     G = { code: newCode(), phase: 'lobby', cats: SL.DEFAULT_CATS.slice(), excluded: SL.DEFAULT_EXCLUDED.slice(), used: [],
-          roundNo: 0, round: null, rounds: [], players: [{ pid: myPid, name: myName, connected: true }] };
+          roundNo: 0, round: null, rounds: [], uids: { [myPid]: fbUid() }, pendingRounds: [],
+          players: [{ pid: myPid, name: myName, connected: true }] };
   }
   code = G.code; conns.clear(); links.clear(); keepAwake(); openHostNet(); schedule(); changed();
 }
@@ -240,7 +241,7 @@ function openHostNet(){
         if (role !== 'host') return;
         claimed = true; statusMsg = '';
         pub(t.info, { host: myPid, ts: Date.now() }, true);
-        changed();
+        changed(); ensureTable();
       }, 1500);
     });
   }, onHostMessage);
@@ -285,10 +286,12 @@ function onClientMsg(from, d){
     }
     const old = conns.get(p.pid); if (old && old.topic !== from) links.delete(old.topic);
     conns.set(p.pid, { topic: from, seen: Date.now() }); links.set(from, p.pid); p.connected = true;
+    setUid(p.pid, d.uid);
     log('join', p.name); changed(); return;
   }
   const pid = links.get(from); if (!pid || !pl(pid)) return;
   touch(pid);
+  if (setUid(pid, d.uid)) changed();
   if (d.t === 'ping') return sendTo(from, { t: 'pong' });
   if (d.t === 'bye') { const p = pl(pid); p.connected = false; conns.delete(pid); links.delete(from); changed(); return; }
   act(pid, d);
@@ -341,6 +344,7 @@ function act(pid, d){
       R.result = res;
       G.rounds.push({ no: R.no, letter: R.letter, cats: R.cats, totals: res.totals, points: res.points,
         names: Object.fromEntries(R.pids.map(x => [x, pl(x)?.name || R.names[x] || '?'])) });
+      recordRound(R, res);
       G.phase = 'results'; break;
     }
     case 'start':                               // sorteia letra e começa nova ronda
@@ -425,7 +429,7 @@ function viewFor(pid){
     players: G.players.map(p => ({ pid: p.pid, name: p.name, connected: p.connected })),
     cats: G.cats, excluded: G.excluded, used: G.used,
     history: G.rounds.map(r => ({ no: r.no, letter: r.letter, totals: r.totals, names: r.names })),
-    round
+    round, tableId: G.tableId || null
   };
 }
 let progressTimer = null;
@@ -435,7 +439,122 @@ function changed(lazy){
   if (lazy) { if (!progressTimer) progressTimer = setTimeout(() => { progressTimer = null; changed(); }, 400); LS.set('host', G); return; }
   clearTimeout(progressTimer); progressTimer = null;
   if (claimed) for (const [pid, c] of conns) sendTo(c.topic, { t: 'state', seq: ++stateSeq, hs: hostSession, v: viewFor(pid) });
-  setView(viewFor(myPid)); LS.set('host', G);
+  setView(viewFor(myPid)); LS.set('host', G); syncTablePlayers();
+}
+
+/* ======================= Persistência (Firebase) ======================= */
+// Tudo aqui é opcional: se o Firebase não carregar (ou não estiver configurado), o jogo funciona na mesma — só não grava.
+const fb = () => (window.FB && window.FB.ok ? window.FB : null);
+const fbUid = () => fb()?.uid || null;
+const isAnon = u => !u || u.startsWith('anon-');
+// uid Firebase de cada jogador (pid = id local do browser). Mantido mesmo depois de o jogador sair / ser removido.
+const uidOf = pid => G?.uids?.[pid] || ('anon-' + String(pid).slice(0, 8));
+function setUid(pid, u){
+  if (!G || !u) return false;
+  u = String(u).slice(0, 128);
+  if ((G.uids = G.uids || {})[pid] === u) return false;
+  G.uids[pid] = u; return true;
+}
+const avg = (a, b) => b ? (a / b).toFixed(1).replace('.', ',') : '–';
+
+function onFbReady(){                       // chamado pelo módulo Firebase após o login anónimo
+  log('firebase pronto', fbUid());
+  if (myName) fb().saveDevice(myName).catch(e => log('device', e));
+  if (role === 'host' && G) { setUid(myPid, fbUid()); ensureTable(); changed(); }
+  if (role === 'client') sayHello();
+  if (!role) render();
+}
+let tablePromise = null;
+function ensureTable(){
+  if (role !== 'host' || !G || !claimed || !fb()) return;
+  if (G.tableId) { syncTablePlayers(); flushRounds(); return; }
+  if (tablePromise) return;
+  tablePromise = fb().createTable(G.code)
+    .then(id => { G.tableId = id; log('mesa criada', id); changed(); flushRounds(); })
+    .catch(e => log('createTable falhou', e))
+    .finally(() => { tablePromise = null; });
+}
+function syncTablePlayers(){                // regista na mesa quem entrou (uid → nome)
+  if (!G || !G.tableId || !fb()) return;
+  const list = G.players.map(p => ({ uid: uidOf(p.pid), name: p.name })).filter(x => !isAnon(x.uid));
+  if (!list.length) return;
+  const key = JSON.stringify(list); if (key === G.syncedKey) return;
+  G.syncedKey = key;
+  fb().syncPlayers(G.tableId, list).catch(e => { G.syncedKey = null; log('syncPlayers', e); });
+}
+// ronda fechada → registo imutável (com todas as respostas) em fila para gravar
+function recordRound(R, res){
+  const end = R.stoppedAt || Date.now();
+  const max = Math.max(0, ...R.pids.map(p => res.totals[p] || 0));
+  const rec = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    no: R.no, letter: R.letter, cats: R.cats.slice(),
+    startedAt: R.startAt, endedAt: end, durationMs: Math.max(0, end - R.startAt),
+    endedBy: R.endedBy || 'host', stoppedBy: R.stoppedBy ? uidOf(R.stoppedBy) : null,
+    results: R.pids.map(p => ({
+      uid: uidOf(p), name: pl(p)?.name || R.names[p] || '?',
+      total: res.totals[p] || 0, win: max > 0 && (res.totals[p] || 0) === max,
+      answers: Object.fromEntries(R.cats.map(c => [c, {
+        t: String(R.answers[p]?.[c] || '').trim().slice(0, SL.MAX_ANSWER), v: !!res.valid[p][c], p: res.points[p][c] }]))
+    }))
+  };
+  rec.playerUids = rec.results.map(r => r.uid).filter(u => !isAnon(u));
+  (G.pendingRounds = G.pendingRounds || []).push(rec);
+  flushRounds();
+}
+let flushing = false;
+function flushRounds(){                     // grava rondas pendentes (sobrevive a falhas de rede / recarregar)
+  if (flushing || role !== 'host' || !G || !fb() || !(G.pendingRounds || []).length) return;
+  if (!G.tableId) return ensureTable();
+  flushing = true;
+  const rec = G.pendingRounds[0];
+  fb().saveRound(G.tableId, rec)
+    .then(() => { G.pendingRounds = G.pendingRounds.filter(r => r.id !== rec.id); log('ronda gravada', rec.id); })
+    .catch(e => {
+      log('saveRound falhou', e);
+      if (e && e.code === 'permission-denied') G.pendingRounds = G.pendingRounds.filter(r => r.id !== rec.id); // já gravada / inválida
+    })
+    .finally(() => { flushing = false; LS.set('host', G); if ((G.pendingRounds || []).length) setTimeout(flushRounds, 5000); });
+}
+
+/* ---- Placard da mesa (persistente) ---- */
+let board = { open: false, data: null, unsub: null };
+function openBoard(){
+  if (!fb() || !view?.tableId) return toast('Placard ainda não disponível.');
+  board.open = true; board.data = null; render();
+  board.unsub = fb().watchTable(view.tableId, d => { board.data = d || {}; if (board.open) render(); });
+}
+function closeBoard(silent){ board.open = false; try { board.unsub && board.unsub(); } catch {} board.unsub = null; if (!silent) render(); }
+const topOf = (m, k) => Object.entries(m || {}).sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(b[0])).slice(0, k);
+function boardRows(d){
+  return Object.entries(d.stats || {}).map(([uid, s]) => ({
+    uid, name: d.players?.[uid]?.name || s.name || '?', rounds: s.rounds || 0, points: s.points || 0,
+    wins: s.wins || 0, stops: s.stops || 0, p20: s.p20 || 0
+  })).sort((a, b) => b.points - a.points || b.wins - a.wins || a.name.localeCompare(b.name));
+}
+function boardScreen(){
+  const d = board.data;
+  let body = '<p class="center muted">A carregar…</p>';
+  if (d) {
+    const rows = boardRows(d), me = fbUid(), letters = topOf(d.letters, 8), cats = topOf(d.cats, 6);
+    body = rows.length ? `<div class="scroll"><table><tr><th>Jogador</th><th class="n">Rondas</th><th class="n">Pontos</th><th class="n">Média</th><th class="n">🏆</th><th class="n">STOP</th><th class="n">20s</th></tr>
+      ${rows.map((r, i) => `<tr class="${r.uid === me ? 'me' : ''}"><td>${i === 0 && r.points ? '👑 ' : ''}${esc(r.name)}</td><td class="n">${r.rounds}</td>
+        <td class="n">${r.points}</td><td class="n">${avg(r.points, r.rounds)}</td><td class="n">${r.wins}</td><td class="n">${r.stops}</td><td class="n">${r.p20}</td></tr>`).join('')}</table></div>
+      <p class="muted" style="font-size:13px;margin:10px 0 0">🏆 = rondas ganhas (empates contam) · STOP = vezes que parou o relógio · 20s = respostas que só ele deu.</p>
+      ${letters.length ? `<h2 style="margin-top:14px">Letras que mais saíram</h2><div class="chips">${letters.map(([l, n]) => `<span class="chip"><b>${esc(l)}</b> × ${n}</span>`).join('')}</div>` : ''}
+      ${cats.length ? `<h2 style="margin-top:14px">Categorias mais jogadas</h2><div class="chips">${cats.map(([c, n]) => `<span class="chip">${esc(catName(c))} × ${n}</span>`).join('')}</div>` : ''}`
+      : '<p class="center muted">Ainda não há rondas gravadas nesta mesa.</p>';
+  }
+  return `<div class="card"><h2>Placard da mesa ${esc(view?.code || '')}${d ? ` · ${d.roundsCount || 0} ronda${d.roundsCount === 1 ? '' : 's'}` : ''}</h2>${body}</div>
+    <button class="sec" data-a="closeBoard">Voltar ao jogo</button>`;
+}
+
+/* ---- Histórico do telemóvel (ecrã inicial) ---- */
+let profile = null, profileLoading = false;
+function loadProfile(){
+  if (!fb() || profile || profileLoading) return;
+  profileLoading = true;
+  fb().myProfile().then(p => { profile = p; if (!role) render(); }).catch(e => log('profile', e)).finally(() => { profileLoading = false; });
 }
 
 /* ======================= Cliente ======================= */
@@ -451,7 +570,7 @@ function joinGame(c){
   clearInterval(pingTimer);
   pingTimer = setInterval(clientTick, 4000);
 }
-function sayHello(){ helloAt = Date.now(); pub(T(code).host, { t: 'hello', from: myPid, name: myName }); }
+function sayHello(){ helloAt = Date.now(); pub(T(code).host, { t: 'hello', from: myPid, name: myName, uid: fbUid() }); }
 function clientTick(){
   if (role !== 'client') return clearInterval(pingTimer);
   if (!netUp()) { if (!view) { statusMsg = 'A ligar aos servidores (0/' + BROKERS.length + ')…'; render(); } return; }
@@ -463,7 +582,7 @@ function clientTick(){
     }
     return;
   }
-  pub(T(code).host, { t: 'ping', from: myPid });
+  pub(T(code).host, { t: 'ping', from: myPid, uid: fbUid() });
   if (now - lastHost > 15000) { statusMsg = 'Sem resposta do anfitrião… (o ecrã dele pode estar bloqueado)'; render(); sayHello(); }
 }
 function onClientMessage(topic, d){
@@ -491,6 +610,7 @@ function setView(v){
     draft = { key, a: saved && saved.key === key ? saved.a : { ...R.mine } };
   }
   const was = prev?.phase;
+  if (board.open && v.phase === 'play' && was !== 'play') closeBoard(true);
   if (v.phase === 'closing' && was === 'play') {
     flushAnswers();
     const by = R.stoppedBy;
@@ -512,6 +632,8 @@ function leave(silent){
   else if (role === 'client') pub(T(code).host, { t: 'bye', from: myPid });
   const r = role; role = null; view = null; G = null; statusMsg = ''; conns.clear(); links.clear();
   draft = { key: null, a: {} }; LS.del('draft'); mainKey = null;
+  if (board.open) { try { board.unsub && board.unsub(); } catch {} board = { open: false, data: null, unsub: null }; }
+  profile = null;
   clearInterval(pingTimer); clearInterval(hbTimer); clearTimeout(claimTimer); clearTimeout(phaseTimer); clearTimeout(ansTimer);
   netEnd();
   if (r) render();
@@ -534,6 +656,7 @@ function render(){
   $('top').innerHTML = topBar();
   $('st').innerHTML = statusMsg ? `<div class="status">${esc(statusMsg)}</div>` : '';
   if (!view) { $('main').innerHTML = `<div class="card center">${esc(statusMsg || 'A ligar…')}</div>`; $('side').innerHTML = ''; mainKey = null; return; }
+  if (board.open) { $('main').innerHTML = boardScreen(); $('side').innerHTML = ''; mainKey = null; return; }
   const v = view, isHost = v.me === v.hostPid;
   // durante a ronda não se reconstroem os campos (mantém foco e cursor) — só se actualiza o resto
   const key = v.phase === 'play' ? `play:${v.round.no}:${v.round.letter ? 1 : 0}` : null;
@@ -561,7 +684,8 @@ setInterval(tick, 250);
 
 function topBar(){
   return `<div class="top"><div class="code">Mesa <b>${esc(code || '')}</b>${role==='host' ? ' · anfitrião' : ''}<br><span style="font-size:12px">servidores ligados: ${netUp()}/${BROKERS.length} · ${VERSION}</span></div>
-    <button class="small danger" id="leave" data-a="leave" style="flex:0 0 auto">${role === 'host' ? 'Fechar mesa' : 'Sair'}</button></div>`;
+    <div class="row" style="flex:0 0 auto;gap:6px">${view?.tableId && fb() && !board.open && !['play', 'closing'].includes(view.phase) ? '<button class="small sec" data-a="board">🏆 Placard</button>' : ''}
+    <button class="small danger" id="leave" data-a="leave">${role === 'host' ? 'Fechar mesa' : 'Sair'}</button></div></div>`;
 }
 
 function renderHome(){
@@ -569,7 +693,8 @@ function renderHome(){
   app.innerHTML = `
     <h1>✋ Jogo do STOP</h1><p class="sub">Sai uma letra — preenche as categorias antes dos outros</p>
     <div class="card"><label for="nm">O teu nickname</label>
-      <input id="nm" maxlength="16" autocomplete="off" placeholder="ex.: Zé" value="${esc(myName)}"></div>
+      <input id="nm" maxlength="16" autocomplete="off" placeholder="ex.: Zé" value="${esc(myName)}">
+      ${profile && profile.rounds ? `<p class="muted" style="margin:10px 0 0;font-size:14px">O teu histórico: <b>${profile.tables}</b> mesa${profile.tables === 1 ? '' : 's'} · <b>${profile.rounds}</b> ronda${profile.rounds === 1 ? '' : 's'} · <b>${profile.points}</b> pontos (média <b>${avg(profile.points, profile.rounds)}</b>) · <b>${profile.wins}</b> vitória${profile.wins === 1 ? '' : 's'} · <b>${profile.stops}</b> STOP${profile.stops === 1 ? '' : 's'}</p>` : ''}</div>
     <div class="card"><h2>Criar jogo</h2><button id="host">Criar mesa</button>
       ${saved && saved.phase ? `<div class="gap"></div><button class="sec" id="resume">Retomar mesa ${esc(saved.code)}</button>` : ''}</div>
     <div class="card"><h2>Entrar num jogo</h2><label for="cdin">Código da mesa</label>
@@ -587,10 +712,12 @@ function renderHome(){
   nm.oninput = () => { myName = nm.value; LS.set('name', myName.trim()); };
   cd.oninput = () => { joinCode = cd.value = cd.value.toUpperCase().replace(/[^A-Z]/g, ''); };
   const needName = () => { myName = nm.value.trim(); if (!myName) { toast('Escreve um nickname primeiro.'); nm.focus(); return false; } LS.set('name', myName); return true; };
-  document.getElementById('host').onclick = () => { if (needName()) { LS.del('host'); startHost(null); } };
-  const r = document.getElementById('resume'); if (r) r.onclick = () => { if (needName()) startHost(saved); };
+  loadProfile();
+  const needNameFb = () => { const ok = needName(); if (ok && fb()) fb().saveDevice(myName).catch(e => log('device', e)); return ok; };
+  document.getElementById('host').onclick = () => { if (needNameFb()) { LS.del('host'); startHost(null); } };
+  const r = document.getElementById('resume'); if (r) r.onclick = () => { if (needNameFb()) startHost(saved); };
   document.getElementById('join').onclick = () => {
-    if (!needName()) return; if (joinCode.length !== 4) return toast('O código tem 4 letras.'); joinGame(joinCode); };
+    if (!needNameFb()) return; if (joinCode.length !== 4) return toast('O código tem 4 letras.'); joinGame(joinCode); };
 }
 
 /* ---- Sala de espera / configuração ---- */
@@ -738,6 +865,8 @@ app.addEventListener('click', e => {
   const a = b.dataset.a;
   switch (a) {
     case 'leave': return leave(false);
+    case 'board': return openBoard();
+    case 'closeBoard': return closeBoard();
     case 'cat': { const id = b.dataset.id, s = new Set(view.cats); s.has(id) ? s.delete(id) : s.add(id); return send({ t: 'cats', ids: [...s] }); }
     case 'rnd': return send({ t: 'cats', ids: SL.randomCats(Number(b.dataset.n)) });
     case 'all': return send({ t: 'cats', ids: SL.CAT_IDS });
@@ -767,6 +896,110 @@ app.addEventListener('keydown', e => {
 });
 
 render();
+</script>
+<script type="module">
+/* ======================= Firebase (Auth anónima + Firestore) ======================= */
+// Os valores abaixo identificam o projeto e são públicos por natureza; a proteção está nas regras do Firestore.
+// TODO: preencher com a configuração da app Web do projeto Firebase (Consola → Definições do projeto → As suas apps).
+const firebaseConfig = {
+  apiKey: "PREENCHER",
+  authDomain: "jogo-stop.firebaseapp.com",
+  projectId: "jogo-stop",
+  storageBucket: "jogo-stop.firebasestorage.app",
+  messagingSenderId: "PREENCHER",
+  appId: "PREENCHER"
+};
+const FB_SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
+const params = new URLSearchParams(location.search);
+const emu = params.get('fbemu');                         // testes locais com o emulador (?fbemu=127.0.0.1)
+const configured = !/PREENCHER/.test(firebaseConfig.apiKey + firebaseConfig.appId);
+
+function deviceInfo(){
+  const ua = navigator.userAgent || '';
+  const platform = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? 'iOS'
+    : /Android/.test(ua) ? 'Android' : 'Desktop';
+  const browser = /SamsungBrowser/.test(ua) ? 'Samsung' : /EdgA?\//.test(ua) ? 'Edge' : /FxiOS|Firefox/.test(ua) ? 'Firefox'
+    : /CriOS|Chrome/.test(ua) ? 'Chrome' : /Safari/.test(ua) ? 'Safari' : 'Outro';
+  return { platform, browser, lang: (navigator.language || '').slice(0, 10) };
+}
+
+if (params.get('nofb') === '1') console.info('[stop] Firebase desligado (?nofb=1).');
+else if (!configured && !emu) console.info('[stop] Firebase por configurar — o jogo funciona sem gravar.');
+else {
+  try {
+    const [{ initializeApp }, A, F] = await Promise.all([
+      import(FB_SDK + 'firebase-app.js'), import(FB_SDK + 'firebase-auth.js'), import(FB_SDK + 'firebase-firestore.js')]);
+    const app = initializeApp(emu ? { ...firebaseConfig, apiKey: 'demo-key', projectId: 'demo-jogo-stop' } : firebaseConfig);
+    const auth = A.getAuth(app), db = F.getFirestore(app);
+    if (emu) { A.connectAuthEmulator(auth, `http://${emu}:9099`, { disableWarnings: true }); F.connectFirestoreEmulator(db, emu, 8085); }
+    const { doc, getDoc, setDoc, updateDoc, collection, addDoc, writeBatch, onSnapshot, query, where, getDocs, limit,
+            serverTimestamp, arrayUnion, increment } = F;
+
+    const FB = window.FB = {
+      ok: false, uid: null,
+      async saveDevice(name){
+        const ref = doc(db, 'devices', FB.uid);
+        const snap = await getDoc(ref);
+        const n = String(name).slice(0, 16);
+        const data = { name: n, names: arrayUnion(n), ...deviceInfo(), lastSeen: serverTimestamp() };
+        if (!snap.exists()) data.firstSeen = serverTimestamp();
+        await setDoc(ref, data, { merge: true });
+      },
+      async createTable(code){
+        const ref = await addDoc(collection(db, 'tables'), {
+          code, hostUid: FB.uid, createdAt: serverTimestamp(), lastActivityAt: serverTimestamp(),
+          roundsCount: 0, playerUids: [], players: {}, stats: {}, letters: {}, cats: {} });
+        return ref.id;
+      },
+      async syncPlayers(tableId, list){
+        const upd = { playerUids: arrayUnion(...list.map(x => x.uid)), lastActivityAt: serverTimestamp() };
+        list.forEach(x => { upd['players.' + x.uid] = { name: x.name }; });
+        await updateDoc(doc(db, 'tables', tableId), upd);
+      },
+      // grava a ronda (imutável, com todas as respostas) e actualiza, no mesmo batch, os agregados da mesa:
+      // stats.{uid} = { name, rounds, points, wins, stops, p20, p10, p5, answers, blank }   letters.{L} / cats.{id} = vezes em jogo
+      async saveRound(tableId, r){
+        const b = writeBatch(db);
+        const { id, ...data } = r;
+        b.set(doc(db, 'tables', tableId, 'rounds', id), { ...data, createdAt: serverTimestamp() });
+        const upd = { roundsCount: increment(1), lastActivityAt: serverTimestamp(), ['letters.' + r.letter]: increment(1) };
+        r.cats.forEach(c => { upd['cats.' + c] = increment(1); });
+        r.results.filter(x => !x.uid.startsWith('anon-')).forEach(x => {
+          const k = 'stats.' + x.uid + '.', a = Object.values(x.answers);
+          upd[k + 'name'] = x.name;
+          upd[k + 'rounds'] = increment(1);
+          upd[k + 'points'] = increment(x.total);
+          upd[k + 'wins'] = increment(x.win ? 1 : 0);
+          upd[k + 'stops'] = increment(r.stoppedBy === x.uid ? 1 : 0);
+          upd[k + 'p20'] = increment(a.filter(y => y.p === 20).length);
+          upd[k + 'p10'] = increment(a.filter(y => y.p === 10).length);
+          upd[k + 'p5'] = increment(a.filter(y => y.p === 5).length);
+          upd[k + 'answers'] = increment(a.length);
+          upd[k + 'blank'] = increment(a.filter(y => !y.t).length);
+        });
+        b.update(doc(db, 'tables', tableId), upd);
+        await b.commit();
+      },
+      watchTable(tableId, cb){
+        return onSnapshot(doc(db, 'tables', tableId), s => cb(s.data()), e => console.warn('[stop] placard', e));
+      },
+      // histórico do telemóvel: soma as estatísticas de todas as mesas onde jogou
+      async myProfile(){
+        const qs = await getDocs(query(collection(db, 'tables'), where('playerUids', 'array-contains', FB.uid), limit(500)));
+        const p = { tables: qs.size, rounds: 0, points: 0, wins: 0, stops: 0, p20: 0 };
+        qs.forEach(d => { const s = d.data().stats?.[FB.uid]; if (!s) return;
+          ['rounds', 'points', 'wins', 'stops', 'p20'].forEach(k => { p[k] += s[k] || 0; }); });
+        return p;
+      }
+    };
+    A.onAuthStateChanged(auth, u => {
+      if (u && !FB.ok) { FB.uid = u.uid; FB.ok = true; try { window.onFbReady && window.onFbReady(); } catch (e) { console.error(e); } }
+    });
+    await A.signInAnonymously(auth);
+  } catch (e) {
+    console.warn('[stop] Firebase indisponível — o jogo continua sem gravar.', e);
+  }
+}
 </script>
 </body>
 </html>

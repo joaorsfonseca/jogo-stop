@@ -31,7 +31,40 @@ Web app multijogador do "jogo dos países": um anfitrião cria a mesa, os outros
   (as dos outros só aparecem depois do STOP; os pontos só no fim). Após o STOP há 2 s de tolerância para receber respostas em trânsito.
 - Estado do anfitrião em `localStorage` (botão "Retomar mesa"); rascunho das respostas do jogador também (sobrevive a recarregar).
 - `?broker=ws://host:porta` troca os brokers (útil para testes com um broker local).
+- `?nofb=1` desliga o Firebase; `?fbemu=127.0.0.1` usa o emulador local.
 - `logic.js`: lógica pura (categorias, normalização, pontuação, sorteio de letras) — testes em `tests/` (`npm test`, Node ≥ 20, sem dependências).
+
+## Persistência (Firebase `jogo-stop`)
+
+Opcional: se o Firebase não estiver configurado ou não carregar, o jogo funciona na mesma (só não grava).
+Login anónimo e invisível (1 `uid` por telemóvel). Só o anfitrião escreve na mesa; as regras estão em `firebase/firestore.rules`.
+
+```
+devices/{uid}                      name, names[], platform, browser, lang, firstSeen, lastSeen
+tables/{tableId}                   code, hostUid, createdAt, lastActivityAt, roundsCount, playerUids[], players.{uid}.name
+                                   stats.{uid}  = { name, rounds, points, wins, stops, p20, p10, p5, answers, blank }
+                                   letters.{L}  = vezes que a letra saiu      cats.{id} = vezes que a categoria foi jogada
+tables/{tableId}/rounds/{roundId}  no, letter, cats[], startedAt, endedAt, durationMs, endedBy ('stop'|'host'), stoppedBy (uid|null)
+                                   playerUids[], results[] = { uid, name, total, win, answers.{cat} = { t, v, p } }   (imutável)
+```
+
+- `answers.{cat}`: `t` = texto, `v` = válida (após revisão do anfitrião), `p` = pontos. Fica o histórico completo de respostas
+  por categoria/letra, base para validação automática e níveis de dificuldade no futuro.
+- **Placard da mesa** (botão 🏆, fora das rondas): rondas, pontos, média, rondas ganhas (empates contam), STOPs, respostas de 20;
+  letras que mais saíram e categorias mais jogadas.
+- **Perfil do telemóvel** (ecrã inicial): soma das mesas onde jogou (`playerUids array-contains uid`).
+- A ronda e os agregados são gravados no mesmo batch. Rondas por gravar ficam em fila no `localStorage` do anfitrião e são reenviadas.
+
+### Configurar
+
+1. Consola Firebase → criar projeto `jogo-stop`.
+2. **Authentication** → Sign-in method → activar **Anónimo**.
+3. **Firestore Database** → criar (modo produção, região `eur3`).
+4. Definições do projeto → As suas apps → **Web** → copiar o `firebaseConfig` para o fim de `index.html`.
+5. Authentication → Settings → **Authorized domains** → adicionar `joaorsfonseca.github.io`.
+6. Publicar regras: `cd firebase && firebase deploy --only firestore:rules,firestore:indexes --project jogo-stop`.
+
+Testes locais: `cd firebase && firebase emulators:start --only auth,firestore --project demo-jogo-stop` e abrir `index.html?fbemu=127.0.0.1`.
 
 ## Categorias
 

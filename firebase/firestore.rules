@@ -1,0 +1,53 @@
+rules_version = '2';
+// Jogo do STOP — regras Firestore
+// Identidade: Firebase Anonymous Auth (invisível para o jogador) → request.auth.uid = id do telemóvel.
+//
+// devices/{uid}                      perfil do telemóvel (só o próprio escreve)
+// tables/{tableId}                   mesa + agregados (stats, letters, cats) — só o anfitrião escreve
+// tables/{tableId}/rounds/{roundId}  ronda terminada, com todas as respostas — só o anfitrião cria; imutável
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isStr(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+
+    match /devices/{uid} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'names', 'platform', 'browser', 'lang', 'firstSeen', 'lastSeen'])
+        && isStr(request.resource.data.name, 0, 16)
+        && request.resource.data.names is list && request.resource.data.names.size() <= 50;
+      allow delete: if false;
+    }
+
+    match /tables/{tableId} {
+      function isHost() { return signedIn() && resource.data.hostUid == request.auth.uid; }
+
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.hostUid == request.auth.uid
+        && isStr(request.resource.data.code, 4, 4)
+        && request.resource.data.roundsCount == 0
+        && request.resource.data.playerUids is list && request.resource.data.playerUids.size() == 0;
+      allow update: if isHost()
+        && request.resource.data.hostUid == resource.data.hostUid
+        && request.resource.data.code == resource.data.code
+        && request.resource.data.roundsCount >= resource.data.roundsCount
+        && request.resource.data.playerUids.size() <= 60;
+      allow delete: if false;
+
+      match /rounds/{roundId} {
+        allow read: if signedIn();
+        allow create: if signedIn()
+          && get(/databases/$(db)/documents/tables/$(tableId)).data.hostUid == request.auth.uid
+          && isStr(request.resource.data.letter, 1, 1)
+          && request.resource.data.cats is list
+          && request.resource.data.cats.size() >= 1 && request.resource.data.cats.size() <= 20
+          && request.resource.data.results is list
+          && request.resource.data.results.size() >= 2 && request.resource.data.results.size() <= 20
+          && request.resource.data.endedBy in ['stop', 'host'];
+        allow update, delete: if false;
+      }
+    }
+  }
+}
