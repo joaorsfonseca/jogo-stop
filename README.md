@@ -34,7 +34,7 @@ Web app multijogador do "jogo dos países": um anfitrião cria a mesa, os outros
 - `?nofb=1` desliga o Firebase; `?fbemu=127.0.0.1` usa o emulador local.
 - `logic.js`: lógica pura (categorias, normalização, pontuação, sorteio de letras) — testes em `tests/` (`npm test`, Node ≥ 20, sem dependências).
 
-## Persistência (Firebase `jogo-stop`)
+## Persistência (Firebase `jogo-stop-6e848`)
 
 Opcional: se o Firebase não estiver configurado ou não carregar, o jogo funciona na mesma (só não grava).
 Login anónimo e invisível (1 `uid` por telemóvel). Só o anfitrião escreve na mesa; as regras estão em `firebase/firestore.rules`.
@@ -57,12 +57,12 @@ tables/{tableId}/rounds/{roundId}  no, letter, cats[], startedAt, endedAt, durat
 
 ### Configurar
 
-1. Consola Firebase → criar projeto `jogo-stop`.
+1. Consola Firebase → projeto `jogo-stop-6e848`.
 2. **Authentication** → Sign-in method → activar **Anónimo**.
 3. **Firestore Database** → criar (modo produção, região `eur3`).
 4. Definições do projeto → As suas apps → **Web** → copiar o `firebaseConfig` para o fim de `index.html`.
 5. Authentication → Settings → **Authorized domains** → adicionar `joaorsfonseca.github.io`.
-6. Publicar regras: `cd firebase && firebase deploy --only firestore:rules,firestore:indexes --project jogo-stop`.
+6. Publicar regras: `cd firebase && firebase deploy --only firestore:rules,firestore:indexes --project jogo-stop-6e848`.
 
 Testes locais: `cd firebase && firebase emulators:start --only auth,firestore --project demo-jogo-stop` e abrir `index.html?fbemu=127.0.0.1`.
 
